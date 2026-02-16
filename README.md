@@ -1,43 +1,44 @@
-# Stock Predictor MVP Stack
+# Stock Predictor MVP Stack (Offline Runnable)
 
-This repository contains a minimal, runnable MVP for stock next-day return prediction.
+This MVP is intentionally dependency-light so it can run in restricted environments.
 
-## Stack
-- Data: `yfinance`
-- Feature engineering: `pandas`
-- Model: `LightGBM`
-- Serving API: `FastAPI`
-- Serialization: `joblib`
+## Components
+- `train_mvp.py`: trains either
+  - a **direction classifier** (logistic SGD, default), or
+  - a **return regressor** (linear SGD)
+- `predict_mvp.py`: loads artifacts and predicts the latest direction/return.
+- `api_mvp.py`: small HTTP server with `/health` and `/predict` endpoints.
 
-## Setup
+## Data source
+- Optional: pass your own CSV with columns: `close,volume`.
+- Default: deterministic synthetic price/volume data is generated.
+
+## Why this version improves directional accuracy
+- Direction task now optimizes a **classification objective** directly.
+- Features expanded (multi-horizon returns, trend spread, vol features, volume change).
+- Includes thresholded confidence reporting (`threshold_coverage`, `threshold_hit_rate`).
+- Includes walk-forward directional validation.
+
+## Train + Evaluate (direction mode)
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python train_mvp.py --task direction --threshold 0.55
 ```
 
-## Train model
+## Optional regression mode
 ```bash
-python train_mvp.py
+python train_mvp.py --task return
 ```
 
-Artifacts are saved to `artifacts/model.joblib` and `artifacts/meta.joblib`.
-
-## Run single prediction
+## Predict
 ```bash
 python predict_mvp.py
 ```
 
-## Run API
+## Serve API
 ```bash
-uvicorn api_mvp:app --reload --port 8000
+python api_mvp.py
 ```
 
-### Endpoints
-- `GET /health`
-- `POST /predict` with body:
-```json
-{
-  "symbol": "AAPL"
-}
-```
+Then open:
+- `http://127.0.0.1:8000/health`
+- `http://127.0.0.1:8000/predict`

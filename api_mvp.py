@@ -1,62 +1,54 @@
+"""Tiny dependency-free HTTP API for MVP predictions.
+
+Endpoints:
+- GET /health
+- GET /predict
+"""
+
+from __future__ import annotations
+
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-import joblib
-import pandas as pd
-import yfinance as yf
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from predict_mvp import predict_latest
 
-MODEL_PATH = Path("artifacts/model.joblib")
-META_PATH = Path("artifacts/meta.joblib")
-
-app = FastAPI(title="Stock Predictor MVP")
+HOST = "127.0.0.1"
+PORT = 8000
+META_PATH = Path("artifacts/meta.json")
 
 
-class PredictRequest(BaseModel):
-    symbol: str = "AAPL"
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/health":
+            self._send_json(200, {"status": "ok"})
+            return
+
+        if self.path == "/predict":
+            try:
+                result = predict_latest()
+                metrics = json.loads(META_PATH.read_text()) if META_PATH.exists() else {}
+                self._send_json(200, {"prediction": result, "metrics": metrics})
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
+
+        self._send_json(404, {"error": "not found"})
 
 
-def build_latest_features(symbol: str, feature_cols: list[str]) -> pd.DataFrame:
-    df = yf.download(symbol, period="6mo", auto_adjust=True, progress=False)
-    if df.empty:
-        raise ValueError("No price data")
-
-    df = df.rename(columns=str.lower)
-    df["ret_1"] = df["close"].pct_change(1)
-    df["ret_5"] = df["close"].pct_change(5)
-    df["ma_5"] = df["close"].rolling(5).mean()
-    df["ma_20"] = df["close"].rolling(20).mean()
-    df["vol_20"] = df["ret_1"].rolling(20).std()
-    df = df.dropna()
-
-    if df.empty:
-        raise ValueError("Not enough history for features")
-
-    return df[feature_cols].tail(1)
+def run() -> None:
+    server = HTTPServer((HOST, PORT), Handler)
+    print(f"Serving MVP API on http://{HOST}:{PORT}")
+    server.serve_forever()
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.post("/predict")
-def predict(req: PredictRequest) -> dict:
-    if not MODEL_PATH.exists() or not META_PATH.exists():
-        raise HTTPException(status_code=500, detail="Model artifacts missing. Run training first.")
-
-    model = joblib.load(MODEL_PATH)
-    meta = joblib.load(META_PATH)
-
-    try:
-        x = build_latest_features(req.symbol, meta["feature_cols"])
-        pred = float(model.predict(x)[0])
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return {
-        "symbol": req.symbol,
-        "predicted_next_day_return": pred,
-        "model_mae": meta.get("mae"),
-        "feature_cols": meta["feature_cols"],
-    }
+if __name__ == "__main__":
+    run()
