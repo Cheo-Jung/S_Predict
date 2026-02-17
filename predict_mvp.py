@@ -1,4 +1,4 @@
-"""MVP batch predictor based on saved model artifacts."""
+"""Predict latest direction using saved artifacts and real OHLCV refresh."""
 
 from __future__ import annotations
 
@@ -7,51 +7,75 @@ import json
 from pathlib import Path
 
 from train_mvp import (
+    apply_strategy,
     build_dataset,
+    fetch_yahoo_ohlcv,
     generate_synthetic_data,
     load_csv,
-    predict_many_linear,
-    predict_many_proba,
     standardize_apply,
 )
 
 MODEL_PATH = Path("artifacts/model.json")
 
 
-def predict_latest(csv_path: Path | None = None) -> dict:
+def resolve_rows(model: dict, csv_path: Path | None, symbol: str | None, start: str, end: str):
+    if csv_path:
+        return load_csv(csv_path), f"csv:{csv_path}"
+
+    src = model.get("source", "yahoo")
+    sym = symbol or model.get("symbol", "AAPL")
+    if src == "yahoo":
+        try:
+            return fetch_yahoo_ohlcv(sym, start, end, "1d"), f"yahoo:{sym}"
+        except Exception:
+            return generate_synthetic_data(seed=7), "synthetic:fallback"
+
+    return generate_synthetic_data(seed=7), "synthetic:fallback"
+
+
+def predict_latest(csv_path: Path | None = None, symbol: str | None = None, start: str = "2016-01-01", end: str = "2100-01-01") -> dict:
     if not MODEL_PATH.exists():
-        raise FileNotFoundError("Missing artifacts/model.json. Run `python train_mvp.py` first.")
+        raise FileNotFoundError("Missing artifacts/model.json. Run training first.")
 
     model = json.loads(MODEL_PATH.read_text())
-    rows = load_csv(csv_path) if csv_path else generate_synthetic_data(seed=7)
-    x, _, _ = build_dataset(rows)
-    x_latest = [x[-1]]
-    x_latest = standardize_apply(x_latest, model["means"], model["stds"])
+    rows, data_source = resolve_rows(model, csv_path, symbol, start, end)
+    x_raw, _, _ = build_dataset(rows)
+    x_std = standardize_apply([x_raw[-1]], model["means"], model["stds"])
 
-    if model.get("task") == "direction":
-        proba_up = predict_many_proba(x_latest, model["weights"], model["bias"])[0]
-        return {
-            "task": "direction",
-            "prob_up": proba_up,
-            "predicted_direction": "UP" if proba_up >= 0.5 else "DOWN",
-        }
+    probs = apply_strategy(model["selected_strategy"], [x_raw[-1]], x_std, model["ensemble_models"])
+    p_up = probs[0]
+    thr = float(model.get("tuned_threshold", 0.5))
 
-    yhat = predict_many_linear(x_latest, model["weights"], model["bias"])[0]
-    return {"task": "return", "predicted_next_day_return": yhat}
+    if p_up >= thr:
+        signal = "UP"
+    elif p_up <= (1.0 - thr):
+        signal = "DOWN"
+    else:
+        signal = "NEUTRAL"
+
+    return {
+        "task": "direction",
+        "symbol": symbol or model.get("symbol", "AAPL"),
+        "data_source": data_source,
+        "selected_strategy": model["selected_strategy"],
+        "prob_up": p_up,
+        "decision_threshold": thr,
+        "predicted_direction": signal,
+    }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", type=Path, default=None, help="Optional OHLCV CSV path")
-    args = parser.parse_args()
-    result = predict_latest(args.csv)
-    if result["task"] == "direction":
-        print(
-            f"Predicted direction: {result['predicted_direction']} "
-            f"(P(up)={result['prob_up']:.4f})"
-        )
-    else:
-        print(f"Predicted next-day return: {result['predicted_next_day_return']:.6%}")
+    p = argparse.ArgumentParser()
+    p.add_argument("--csv", type=Path, default=None)
+    p.add_argument("--symbol", default=None)
+    p.add_argument("--start", default="2016-01-01")
+    p.add_argument("--end", default="2100-01-01")
+    args = p.parse_args()
+    r = predict_latest(args.csv, args.symbol, args.start, args.end)
+    print(
+        f"{r['symbol']} => {r['predicted_direction']} "
+        f"(P(up)={r['prob_up']:.4f}, thr={r['decision_threshold']:.2f}, strategy={r['selected_strategy']}, source={r['data_source']})"
+    )
 
 
 if __name__ == "__main__":

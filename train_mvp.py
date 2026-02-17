@@ -1,14 +1,10 @@
-"""Dependency-light MVP trainer for stock return/direction prediction.
+"""Real-data-first stock/crypto direction predictor (dependency-light).
 
-Improvements focused on directional accuracy:
-- classification objective (logistic SGD) for direction task
-- richer handcrafted features
-- thresholded directional evaluation (coverage + hit rate)
-- walk-forward directional validation
-
-This script can train from:
-1) local CSV file with columns: close,volume
-2) generated synthetic OHLCV-like data when no CSV is provided
+Key goals:
+- Use real OHLCV when available (Yahoo Finance HTTP API, or CSV input)
+- Engineer practical technical features from OHLCV
+- Train/evaluate direction model with time-aware split
+- Persist artifacts for CLI/API inference
 """
 
 from __future__ import annotations
@@ -18,7 +14,12 @@ import csv
 import json
 import math
 import random
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -29,74 +30,175 @@ META_PATH = ARTIFACT_DIR / "meta.json"
 
 @dataclass
 class Row:
+    ts: int
+    open: float
+    high: float
+    low: float
     close: float
     volume: float
 
 
-def generate_synthetic_data(days: int = 1500, seed: int = 42) -> list[Row]:
+def parse_date_to_epoch(date_str: str) -> int:
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def generate_synthetic_data(days: int = 1800, seed: int = 42) -> list[Row]:
     random.seed(seed)
-    price = 100.0
+    px = 100.0
     prev_ret = 0.0
-    data: list[Row] = []
-    for _ in range(days):
-        drift = 0.0004
-        noise = random.gauss(0, 0.010)
-        # mild auto-correlation to emulate weak momentum regimes
-        ret = drift + 0.18 * prev_ret + noise
-        price = max(1.0, price * (1 + ret))
-        volume = 1_000_000 + random.randint(-150_000, 150_000)
-        data.append(Row(close=price, volume=float(volume)))
-        prev_ret = ret
-    return data
+    t0 = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
+    out: list[Row] = []
+    for i in range(days):
+        noise = random.gauss(0, 0.01)
+        ret = 0.0003 + 0.18 * prev_ret + noise
+        op = px
+        cl = max(1.0, op * (1 + ret))
+        amp = abs(random.gauss(0.006, 0.003))
+        hi = max(op, cl) * (1 + amp)
+        lo = min(op, cl) * (1 - amp)
+        vol = float(1_000_000 + random.randint(-220_000, 220_000))
+        out.append(Row(ts=t0 + i * 86400, open=op, high=hi, low=lo, close=cl, volume=vol))
+        px, prev_ret = cl, ret
+    return out
 
 
 def load_csv(path: Path) -> list[Row]:
     rows: list[Row] = []
     with path.open("r", newline="") as f:
         reader = csv.DictReader(f)
-        required = {"close", "volume"}
+        required = {"timestamp", "open", "high", "low", "close", "volume"}
         if not required.issubset(set(reader.fieldnames or [])):
-            raise ValueError("CSV must include columns: close, volume")
+            raise ValueError("CSV must include: timestamp,open,high,low,close,volume")
         for rec in reader:
-            rows.append(Row(close=float(rec["close"]), volume=float(rec["volume"])))
-    if len(rows) < 250:
-        raise ValueError("Need at least 250 rows for training/evaluation")
+            ts_raw = rec["timestamp"].strip()
+            try:
+                ts = int(ts_raw)
+            except ValueError:
+                ts = parse_date_to_epoch(ts_raw)
+            rows.append(
+                Row(
+                    ts=ts,
+                    open=float(rec["open"]),
+                    high=float(rec["high"]),
+                    low=float(rec["low"]),
+                    close=float(rec["close"]),
+                    volume=float(rec["volume"]),
+                )
+            )
+    rows.sort(key=lambda r: r.ts)
+    if len(rows) < 300:
+        raise ValueError("Need at least 300 OHLCV rows")
     return rows
 
 
-def pct_change(values: list[float], lag: int) -> list[float | None]:
-    out: list[float | None] = [None] * len(values)
-    for i in range(lag, len(values)):
-        prev = values[i - lag]
-        out[i] = (values[i] / prev - 1.0) if prev else None
+def fetch_yahoo_ohlcv(symbol: str, start: str, end: str, interval: str = "1d") -> list[Row]:
+    p1 = parse_date_to_epoch(start)
+    p2 = parse_date_to_epoch(end)
+    query = urllib.parse.urlencode(
+        {
+            "period1": p1,
+            "period2": p2,
+            "interval": interval,
+            "events": "history",
+            "includeAdjustedClose": "true",
+        }
+    )
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?{query}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        payload = json.loads(r.read().decode("utf-8"))
+
+    result = payload.get("chart", {}).get("result", [])
+    if not result:
+        raise ValueError("Yahoo response missing chart result")
+
+    node = result[0]
+    ts_list = node.get("timestamp") or []
+    quote = (node.get("indicators", {}).get("quote") or [{}])[0]
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    vols = quote.get("volume") or []
+
+    rows: list[Row] = []
+    n = min(len(ts_list), len(opens), len(highs), len(lows), len(closes), len(vols))
+    for i in range(n):
+        vals = (ts_list[i], opens[i], highs[i], lows[i], closes[i], vols[i])
+        if any(v is None for v in vals):
+            continue
+        o, h, l, c = float(opens[i]), float(highs[i]), float(lows[i]), float(closes[i])
+        if c <= 0 or h <= 0 or l <= 0 or o <= 0:
+            continue
+        rows.append(Row(ts=int(ts_list[i]), open=o, high=h, low=l, close=c, volume=float(vols[i])))
+
+    if len(rows) < 300:
+        raise ValueError(f"Not enough Yahoo rows for {symbol}: {len(rows)}")
+    return rows
+
+
+def pct_change(vals: list[float], lag: int) -> list[float | None]:
+    out: list[float | None] = [None] * len(vals)
+    for i in range(lag, len(vals)):
+        prev = vals[i - lag]
+        out[i] = (vals[i] / prev - 1.0) if prev else None
     return out
 
 
-def rolling_mean(values: list[float], window: int) -> list[float | None]:
-    out: list[float | None] = [None] * len(values)
-    running = 0.0
-    for i, v in enumerate(values):
-        running += v
+def rolling_mean(vals: list[float], window: int) -> list[float | None]:
+    out: list[float | None] = [None] * len(vals)
+    s = 0.0
+    for i, v in enumerate(vals):
+        s += v
         if i >= window:
-            running -= values[i - window]
+            s -= vals[i - window]
         if i >= window - 1:
-            out[i] = running / window
+            out[i] = s / window
     return out
 
 
-def rolling_std(values: list[float], window: int) -> list[float | None]:
-    out: list[float | None] = [None] * len(values)
-    for i in range(window - 1, len(values)):
-        chunk = values[i - window + 1 : i + 1]
-        mean = sum(chunk) / window
-        var = sum((x - mean) ** 2 for x in chunk) / window
-        out[i] = math.sqrt(var)
+def rolling_std(vals: list[float], window: int) -> list[float | None]:
+    out: list[float | None] = [None] * len(vals)
+    for i in range(window - 1, len(vals)):
+        chunk = vals[i - window + 1 : i + 1]
+        m = sum(chunk) / window
+        out[i] = math.sqrt(sum((x - m) ** 2 for x in chunk) / window)
     return out
+
+
+def rsi(closes: list[float], window: int = 14) -> list[float | None]:
+    out: list[float | None] = [None] * len(closes)
+    gains = [0.0] * len(closes)
+    losses = [0.0] * len(closes)
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains[i] = max(d, 0.0)
+        losses[i] = max(-d, 0.0)
+    for i in range(window, len(closes)):
+        avg_g = sum(gains[i - window + 1 : i + 1]) / window
+        avg_l = sum(losses[i - window + 1 : i + 1]) / window
+        if avg_l == 0:
+            out[i] = 100.0
+        else:
+            rs = avg_g / avg_l
+            out[i] = 100.0 - (100.0 / (1.0 + rs))
+    return out
+
+
+def atr(high: list[float], low: list[float], close: list[float], window: int = 14) -> list[float | None]:
+    tr = [0.0] * len(close)
+    for i in range(1, len(close)):
+        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+    return rolling_mean(tr, window)
 
 
 def build_dataset(rows: list[Row]) -> tuple[list[list[float]], list[float], list[int]]:
     close = [r.close for r in rows]
-    volume = [r.volume for r in rows]
+    high = [r.high for r in rows]
+    low = [r.low for r in rows]
+    open_ = [r.open for r in rows]
+    vol = [r.volume for r in rows]
 
     ret1 = pct_change(close, 1)
     ret3 = pct_change(close, 3)
@@ -104,54 +206,67 @@ def build_dataset(rows: list[Row]) -> tuple[list[list[float]], list[float], list
     ret10 = pct_change(close, 10)
     ma5 = rolling_mean(close, 5)
     ma20 = rolling_mean(close, 20)
-    vol10 = rolling_std([r if r is not None else 0.0 for r in pct_change(close, 1)], 10)
-    vol20 = rolling_std([r if r is not None else 0.0 for r in pct_change(close, 1)], 20)
-    vol_chg_5 = pct_change(volume, 5)
+    ma50 = rolling_mean(close, 50)
+    vol_std20 = rolling_std([x if x is not None else 0.0 for x in ret1], 20)
+    vol_chg5 = pct_change(vol, 5)
+    rsi14 = rsi(close, 14)
+    atr14 = atr(high, low, close, 14)
 
-    features: list[list[float]] = []
-    target_ret: list[float] = []
-    target_dir: list[int] = []
+    x: list[list[float]] = []
+    y_ret: list[float] = []
+    y_dir: list[int] = []
 
     for i in range(len(rows) - 1):
-        vals = [ret1[i], ret3[i], ret5[i], ret10[i], ma5[i], ma20[i], vol10[i], vol20[i], vol_chg_5[i]]
+        vals = [ret1[i], ret3[i], ret5[i], ret10[i], ma5[i], ma20[i], ma50[i], vol_std20[i], vol_chg5[i], rsi14[i], atr14[i]]
         if any(v is None for v in vals):
             continue
 
         next_ret = close[i + 1] / close[i] - 1.0
-        features.append(
-            [
-                float(ret1[i]),
-                float(ret3[i]),
-                float(ret5[i]),
-                float(ret10[i]),
-                float(ma5[i] / close[i] - 1.0),
-                float(ma20[i] / close[i] - 1.0),
-                float((ma5[i] - ma20[i]) / close[i]),
-                float(vol10[i]),
-                float(vol20[i]),
-                float(volume[i] / 1_000_000.0),
-                float(vol_chg_5[i]),
-            ]
-        )
-        target_ret.append(next_ret)
-        target_dir.append(1 if next_ret >= 0 else 0)
+        candle_body = (close[i] - open_[i]) / open_[i]
+        hl_range = (high[i] - low[i]) / close[i]
 
-    return features, target_ret, target_dir
+        feats = [
+            float(ret1[i]),
+            float(ret3[i]),
+            float(ret5[i]),
+            float(ret10[i]),
+            float(ma5[i] / close[i] - 1.0),
+            float(ma20[i] / close[i] - 1.0),
+            float(ma50[i] / close[i] - 1.0),
+            float((ma5[i] - ma20[i]) / close[i]),
+            float(vol_std20[i]),
+            float(vol[i] / 1_000_000.0),
+            float(vol_chg5[i]),
+            float(rsi14[i] / 100.0),
+            float(atr14[i] / close[i]),
+            float(candle_body),
+            float(hl_range),
+            float(ret1[i]) * float(hl_range),
+            float(ret3[i]) * float(vol_std20[i]),
+        ]
+
+        x.append(feats)
+        y_ret.append(next_ret)
+        y_dir.append(1 if next_ret >= 0 else 0)
+
+    if len(x) < 220:
+        raise ValueError("Not enough feature rows after engineering")
+    return x, y_ret, y_dir
 
 
 def standardize_fit(features: list[list[float]]) -> tuple[list[float], list[float]]:
-    n_features = len(features[0])
-    means = [sum(row[j] for row in features) / len(features) for j in range(n_features)]
+    n = len(features[0])
+    means = [sum(r[j] for r in features) / len(features) for j in range(n)]
     stds = []
-    for j in range(n_features):
-        var = sum((row[j] - means[j]) ** 2 for row in features) / len(features)
-        std = math.sqrt(var)
-        stds.append(std if std > 1e-12 else 1.0)
+    for j in range(n):
+        var = sum((r[j] - means[j]) ** 2 for r in features) / len(features)
+        s = math.sqrt(var)
+        stds.append(s if s > 1e-12 else 1.0)
     return means, stds
 
 
 def standardize_apply(features: list[list[float]], means: list[float], stds: list[float]) -> list[list[float]]:
-    return [[(row[j] - means[j]) / stds[j] for j in range(len(row))] for row in features]
+    return [[(r[j] - means[j]) / stds[j] for j in range(len(r))] for r in features]
 
 
 def sigmoid(x: float) -> float:
@@ -162,157 +277,186 @@ def sigmoid(x: float) -> float:
     return z / (1.0 + z)
 
 
-def fit_logistic_sgd(features: list[list[float]], labels: list[int], lr: float = 0.03, epochs: int = 300) -> tuple[list[float], float]:
-    n_features = len(features[0])
-    weights = [0.0] * n_features
-    bias = 0.0
-
+def fit_logistic_sgd(features: list[list[float]], labels: list[int], lr: float, epochs: int, l2: float) -> tuple[list[float], float]:
+    w = [0.0] * len(features[0])
+    b = 0.0
     for _ in range(epochs):
-        for xi, yi in zip(features, labels):
-            z = bias + sum(w * x for w, x in zip(weights, xi))
-            p = sigmoid(z)
-            err = p - yi
-            bias -= lr * err
-            for j in range(n_features):
-                weights[j] -= lr * err * xi[j]
-    return weights, bias
-
-
-def fit_linear_sgd(features: list[list[float]], target: list[float], lr: float = 0.03, epochs: int = 300) -> tuple[list[float], float]:
-    n_features = len(features[0])
-    weights = [0.0] * n_features
-    bias = 0.0
-
-    for _ in range(epochs):
-        for xi, yi in zip(features, target):
-            pred = bias + sum(w * x for w, x in zip(weights, xi))
-            err = pred - yi
-            bias -= lr * err
-            for j in range(n_features):
-                weights[j] -= lr * err * xi[j]
-    return weights, bias
-
-
-def predict_many_linear(features: Iterable[list[float]], weights: list[float], bias: float) -> list[float]:
-    return [bias + sum(w * x for w, x in zip(weights, xi)) for xi in features]
+        for x, y in zip(features, labels):
+            p = sigmoid(b + sum(wi * xi for wi, xi in zip(w, x)))
+            e = p - y
+            b -= lr * e
+            for j in range(len(w)):
+                w[j] -= lr * (e * x[j] + l2 * w[j])
+    return w, b
 
 
 def predict_many_proba(features: Iterable[list[float]], weights: list[float], bias: float) -> list[float]:
-    return [sigmoid(bias + sum(w * x for w, x in zip(weights, xi))) for xi in features]
+    return [sigmoid(bias + sum(w * x for w, x in zip(weights, row))) for row in features]
 
 
-def mae(y_true: list[float], y_pred: list[float]) -> float:
-    return sum(abs(a - b) for a, b in zip(y_true, y_pred)) / len(y_true)
+def predict_momentum_direction(features_raw: list[list[float]], lag_idx: int = 0) -> list[float]:
+    return [0.70 if r[lag_idx] >= 0 else 0.30 for r in features_raw]
 
 
-def rmse(y_true: list[float], y_pred: list[float]) -> float:
-    return math.sqrt(sum((a - b) ** 2 for a, b in zip(y_true, y_pred)) / len(y_true))
+def directional_accuracy(y_true: list[int], probs: list[float], thr: float = 0.5) -> float:
+    pred = [1 if p >= thr else 0 for p in probs]
+    return sum(int(a == b) for a, b in zip(y_true, pred)) / len(y_true)
 
 
-def directional_accuracy_from_sign(y_true: list[float], y_pred: list[float]) -> float:
-    correct = 0
-    for a, b in zip(y_true, y_pred):
-        if (a >= 0 and b >= 0) or (a < 0 and b < 0):
-            correct += 1
-    return correct / len(y_true)
-
-
-def directional_accuracy_cls(y_true: list[int], proba: list[float], threshold: float = 0.5) -> float:
-    preds = [1 if p >= threshold else 0 for p in proba]
-    correct = sum(int(a == b) for a, b in zip(y_true, preds))
-    return correct / len(y_true)
-
-
-def thresholded_hit_rate(y_true: list[int], proba: list[float], upper: float = 0.55, lower: float = 0.45) -> tuple[float, float]:
-    selected_idx = [i for i, p in enumerate(proba) if p >= upper or p <= lower]
-    if not selected_idx:
+def thresholded_hit_rate(y_true: list[int], probs: list[float], thr: float) -> tuple[float, float]:
+    idx = [i for i, p in enumerate(probs) if p >= thr or p <= (1.0 - thr)]
+    if not idx:
         return 0.0, 0.0
-    correct = 0
-    for i in selected_idx:
-        pred = 1 if proba[i] >= upper else 0
-        if pred == y_true[i]:
-            correct += 1
-    coverage = len(selected_idx) / len(y_true)
-    hit_rate = correct / len(selected_idx)
-    return coverage, hit_rate
+    hit = sum(int((1 if probs[i] >= thr else 0) == y_true[i]) for i in idx) / len(idx)
+    cov = len(idx) / len(y_true)
+    return cov, hit
 
 
-def walk_forward_directional_accuracy(
-    x: list[list[float]],
-    y_dir: list[int],
-    train_window: int = 600,
-    test_window: int = 100,
-) -> float:
+def tune_threshold(y_true: list[int], probs: list[float], min_cov: float = 0.20) -> tuple[float, float, float]:
+    best_thr, best_hit, best_cov = 0.5, directional_accuracy(y_true, probs, 0.5), 1.0
+    for s in range(50, 76):
+        thr = s / 100.0
+        cov, hit = thresholded_hit_rate(y_true, probs, thr)
+        if cov < min_cov:
+            continue
+        if (0.8 * hit + 0.2 * cov) > (0.8 * best_hit + 0.2 * best_cov):
+            best_thr, best_hit, best_cov = thr, hit, cov
+    return best_thr, best_cov, best_hit
+
+
+def walk_forward_directional_accuracy(x_raw: list[list[float]], y_dir: list[int], train_window: int = 500, test_window: int = 120) -> float:
     scores: list[float] = []
-    start = 0
-    while start + train_window + test_window <= len(x):
-        x_tr = x[start : start + train_window]
-        y_tr = y_dir[start : start + train_window]
-        x_te = x[start + train_window : start + train_window + test_window]
-        y_te = y_dir[start + train_window : start + train_window + test_window]
-
-        means, stds = standardize_fit(x_tr)
-        x_tr_s = standardize_apply(x_tr, means, stds)
-        x_te_s = standardize_apply(x_te, means, stds)
-
-        w, b = fit_logistic_sgd(x_tr_s, y_tr, lr=0.03, epochs=200)
-        p = predict_many_proba(x_te_s, w, b)
-        scores.append(directional_accuracy_cls(y_te, p, threshold=0.5))
-        start += test_window
-
+    i = 0
+    while i + train_window + test_window <= len(x_raw):
+        xtr = x_raw[i : i + train_window]
+        ytr = y_dir[i : i + train_window]
+        xte = x_raw[i + train_window : i + train_window + test_window]
+        yte = y_dir[i + train_window : i + train_window + test_window]
+        m, s = standardize_fit(xtr)
+        xtr_s = standardize_apply(xtr, m, s)
+        xte_s = standardize_apply(xte, m, s)
+        w, b = fit_logistic_sgd(xtr_s, ytr, lr=0.02, epochs=260, l2=0.0006)
+        p = predict_many_proba(xte_s, w, b)
+        scores.append(directional_accuracy(yte, p, 0.5))
+        i += test_window
     return sum(scores) / len(scores) if scores else 0.0
 
 
-def train(csv_path: Path | None = None, task: str = "direction", threshold: float = 0.55) -> dict:
-    rows = load_csv(csv_path) if csv_path else generate_synthetic_data()
-    x, y_ret, y_dir = build_dataset(rows)
-    cut = int(len(x) * 0.8)
+def select_best_strategy(x_val_raw: list[list[float]], x_val_std: list[list[float]], y_val: list[int], ensemble_models: list[dict]) -> tuple[str, list[float]]:
+    p_logit = [sum(v) / len(v) for v in zip(*[predict_many_proba(x_val_std, m["weights"], m["bias"]) for m in ensemble_models])]
+    p_mom1 = predict_momentum_direction(x_val_raw, 0)
+    p_mom3 = predict_momentum_direction(x_val_raw, 1)
+    p_blend = [0.65 * a + 0.35 * b for a, b in zip(p_logit, p_mom1)]
 
-    x_train, x_test = x[:cut], x[cut:]
-    y_train_ret, y_test_ret = y_ret[:cut], y_ret[cut:]
-    y_train_dir, y_test_dir = y_dir[:cut], y_dir[cut:]
+    cands = {
+        "logistic_ensemble": p_logit,
+        "momentum_ret1": p_mom1,
+        "momentum_ret3": p_mom3,
+        "blend_logit_mom1": p_blend,
+    }
+    best = max(cands.items(), key=lambda kv: directional_accuracy(y_val, kv[1], 0.5))
+    return best[0], best[1]
+
+
+def apply_strategy(name: str, x_raw: list[list[float]], x_std: list[list[float]], ensemble_models: list[dict]) -> list[float]:
+    if name == "logistic_ensemble":
+        return [sum(v) / len(v) for v in zip(*[predict_many_proba(x_std, m["weights"], m["bias"]) for m in ensemble_models])]
+    if name == "momentum_ret1":
+        return predict_momentum_direction(x_raw, 0)
+    if name == "momentum_ret3":
+        return predict_momentum_direction(x_raw, 1)
+    if name == "blend_logit_mom1":
+        p1 = apply_strategy("logistic_ensemble", x_raw, x_std, ensemble_models)
+        p2 = predict_momentum_direction(x_raw, 0)
+        return [0.65 * a + 0.35 * b for a, b in zip(p1, p2)]
+    raise ValueError(f"Unknown strategy: {name}")
+
+
+def get_rows(csv_path: Path | None, symbol: str, source: str, start: str, end: str) -> tuple[list[Row], str]:
+    if csv_path:
+        return load_csv(csv_path), f"csv:{csv_path}"
+
+    if source == "yahoo":
+        try:
+            rows = fetch_yahoo_ohlcv(symbol=symbol, start=start, end=end, interval="1d")
+            return rows, f"yahoo:{symbol}"
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            print(f"[WARN] Yahoo fetch failed ({exc}); fallback to synthetic data")
+
+    return generate_synthetic_data(), "synthetic:fallback"
+
+
+def train(csv_path: Path | None, symbol: str, source: str, start: str, end: str) -> dict:
+    rows, data_source = get_rows(csv_path, symbol, source, start, end)
+    x_raw, y_ret, y_dir = build_dataset(rows)
+
+    n = len(x_raw)
+    tr_end = int(n * 0.70)
+    val_end = int(n * 0.85)
+
+    x_train, x_val, x_test = x_raw[:tr_end], x_raw[tr_end:val_end], x_raw[val_end:]
+    y_train, y_val, y_test = y_dir[:tr_end], y_dir[tr_end:val_end], y_dir[val_end:]
 
     means, stds = standardize_fit(x_train)
     x_train_s = standardize_apply(x_train, means, stds)
+    x_val_s = standardize_apply(x_val, means, stds)
     x_test_s = standardize_apply(x_test, means, stds)
 
-    model: dict
-    metrics: dict[str, float | int | str]
+    grid = [
+        {"lr": 0.015, "epochs": 320, "l2": 0.0002},
+        {"lr": 0.020, "epochs": 280, "l2": 0.0005},
+        {"lr": 0.025, "epochs": 240, "l2": 0.0010},
+        {"lr": 0.030, "epochs": 200, "l2": 0.0012},
+    ]
 
-    if task == "direction":
-        weights, bias = fit_logistic_sgd(x_train_s, y_train_dir)
-        proba = predict_many_proba(x_test_s, weights, bias)
-        signed_pred = [1.0 if p >= 0.5 else -1.0 for p in proba]
-        pseudo_ret = [s * 0.001 for s in signed_pred]
-        coverage, hit_rate = thresholded_hit_rate(y_test_dir, proba, upper=threshold, lower=1 - threshold)
+    scored = []
+    for cfg in grid:
+        w, b = fit_logistic_sgd(x_train_s, y_train, cfg["lr"], cfg["epochs"], cfg["l2"])
+        pv = predict_many_proba(x_val_s, w, b)
+        scored.append((directional_accuracy(y_val, pv, 0.5), cfg, w, b))
+    scored.sort(key=lambda t: t[0], reverse=True)
 
-        metrics = {
-            "task": "direction",
-            "directional_accuracy": directional_accuracy_cls(y_test_dir, proba, threshold=0.5),
-            "walk_forward_directional_accuracy": walk_forward_directional_accuracy(x, y_dir),
-            "threshold": threshold,
-            "threshold_coverage": coverage,
-            "threshold_hit_rate": hit_rate,
-            "mae_proxy": mae(y_test_ret, pseudo_ret),
-            "rmse_proxy": rmse(y_test_ret, pseudo_ret),
-            "train_rows": len(x_train),
-            "test_rows": len(x_test),
-            "data_source": str(csv_path) if csv_path else "synthetic",
-        }
-        model = {"task": "direction", "weights": weights, "bias": bias, "means": means, "stds": stds}
-    else:
-        weights, bias = fit_linear_sgd(x_train_s, y_train_ret)
-        pred = predict_many_linear(x_test_s, weights, bias)
-        metrics = {
-            "task": "return",
-            "mae": mae(y_test_ret, pred),
-            "rmse": rmse(y_test_ret, pred),
-            "directional_accuracy": directional_accuracy_from_sign(y_test_ret, pred),
-            "train_rows": len(x_train),
-            "test_rows": len(x_test),
-            "data_source": str(csv_path) if csv_path else "synthetic",
-        }
-        model = {"task": "return", "weights": weights, "bias": bias, "means": means, "stds": stds}
+    ens = [{"cfg": cfg, "weights": w, "bias": b} for _, cfg, w, b in scored[:3]]
+    strat, p_val = select_best_strategy(x_val, x_val_s, y_val, ens)
+    thr, val_cov, val_hit = tune_threshold(y_val, p_val, min_cov=0.25)
+
+    p_test = apply_strategy(strat, x_test, x_test_s, ens)
+    acc = directional_accuracy(y_test, p_test, 0.5)
+    cov, hit = thresholded_hit_rate(y_test, p_test, thr)
+    wf = walk_forward_directional_accuracy(x_raw, y_dir)
+
+    model = {
+        "task": "direction",
+        "selected_strategy": strat,
+        "tuned_threshold": thr,
+        "ensemble_models": [{"weights": m["weights"], "bias": m["bias"], "cfg": m["cfg"]} for m in ens],
+        "means": means,
+        "stds": stds,
+        "symbol": symbol,
+        "source": source,
+        "start": start,
+        "end": end,
+        "trained_at": int(time.time()),
+    }
+
+    metrics = {
+        "task": "direction",
+        "data_source": data_source,
+        "symbol": symbol,
+        "source": source,
+        "split": "70/15/15",
+        "selected_strategy": strat,
+        "directional_accuracy": acc,
+        "walk_forward_directional_accuracy": wf,
+        "tuned_threshold": thr,
+        "validation_threshold_coverage": val_cov,
+        "validation_threshold_hit_rate": val_hit,
+        "threshold_coverage": cov,
+        "threshold_hit_rate": hit,
+        "train_rows": len(x_train),
+        "val_rows": len(x_val),
+        "test_rows": len(x_test),
+    }
 
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_PATH.write_text(json.dumps(model, indent=2))
@@ -330,12 +474,14 @@ def train(csv_path: Path | None = None, task: str = "direction", threshold: floa
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", type=Path, default=None, help="Optional OHLCV CSV path")
-    parser.add_argument("--task", choices=["direction", "return"], default="direction")
-    parser.add_argument("--threshold", type=float, default=0.55, help="Confidence threshold for hit-rate report")
-    args = parser.parse_args()
-    train(args.csv, task=args.task, threshold=args.threshold)
+    p = argparse.ArgumentParser()
+    p.add_argument("--csv", type=Path, default=None, help="CSV path with timestamp,open,high,low,close,volume")
+    p.add_argument("--symbol", default="AAPL", help="Ticker or crypto symbol for Yahoo (e.g., AAPL, BTC-USD)")
+    p.add_argument("--source", choices=["yahoo"], default="yahoo")
+    p.add_argument("--start", default="2016-01-01")
+    p.add_argument("--end", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    args = p.parse_args()
+    train(args.csv, args.symbol, args.source, args.start, args.end)
 
 
 if __name__ == "__main__":
