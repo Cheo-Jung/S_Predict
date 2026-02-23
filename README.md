@@ -7,7 +7,7 @@ This MVP is intentionally dependency-light so it can run in restricted environme
   - a **direction classifier** (logistic SGD, default), or
   - a **return regressor** (linear SGD)
 - `predict_mvp.py`: loads artifacts and predicts the latest direction/return.
-- `api_mvp.py`: small HTTP server with `/health` and `/predict` endpoints.
+- `api_mvp.py`: small HTTP server with `/health`, `/predict`, `/meta`, and a built-in web GUI at `/`.
 
 ## Data source
 - Optional: pass your own CSV with columns: `close,volume`.
@@ -40,5 +40,7 @@ python api_mvp.py
 ```
 
 Then open:
+- `http://127.0.0.1:8000/` (GUI dashboard)
 - `http://127.0.0.1:8000/health`
 - `http://127.0.0.1:8000/predict`
+- `http://127.0.0.1:8000/meta`
